@@ -29,6 +29,7 @@ disclosure scan \
 	[repo-path]
 disclosure text \
 	[--format=json|text] [--input=FILE|-] \
+	[--custom-tools=FILE] \
 	[--checkbox-label-ai-used="AI was used"] \
 	[--checkbox-label-ai-not-used="AI was not used"]
 disclosure version
@@ -58,6 +59,42 @@ echo "I used Claude to write this PR" | disclosure text --format=json
 
 disclosure text --input=pr-body.txt
 ```
+
+#### Custom tool and model names
+
+The `text` command can supplement the built-in names with a local JSON file:
+
+```json
+{
+  "version": 1,
+  "custom_tools": [
+    "GPT-4 Turbo",
+    "Claude Opus 4.6"
+  ]
+}
+```
+
+```sh
+disclosure text --custom-tools=tools.json --input=pr-body.txt
+echo "I used GPT-4 Turbo" | disclosure text --custom-tools=tools.json --format=json
+```
+
+Names use the existing case-insensitive, word-boundary matching rules. Spaces
+and hyphens in names also match whitespace, underscores, or hyphens in text;
+regex metacharacters are treated literally. Surrounding whitespace is trimmed,
+and case-insensitive duplicates are ignored, preferring the built-in spelling
+or the first custom spelling. Overlapping mentions at the same position prefer
+the longer name.
+
+Custom names also work with checkbox detection. They apply only to the current
+`text` invocation; `scan` and the built-in list are unchanged. No catalogue is
+downloaded during scanning. Choose specific names to avoid ordinary words
+producing false positives.
+
+The file must contain a single JSON object with `version: 1` and a `custom_tools`
+array of non-empty strings. An empty array keeps the built-in names only.
+Unreadable files, invalid entries, unknown fields, and unsupported versions
+produce an error (exit code `2`).
 
 ### Numeric scoring
 

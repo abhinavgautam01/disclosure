@@ -1,6 +1,7 @@
 package toolmention
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -13,28 +14,34 @@ import (
 
 func getToolPatterns() []toolPattern {
 	var toolPatterns []toolPattern
-	const separator = `[\s_-]+`
 	names := append([]string(nil), detection.SupportedToolsInMentions...)
 	for _, name := range names {
-		parts := strings.FieldsFunc(name, func(r rune) bool {
-			return r == ' ' || r == '-'
-		})
-		for i := range parts {
-			parts[i] = regexp.QuoteMeta(parts[i])
-		}
-		pattern := `(?i)\b` + strings.Join(parts, separator)
-		last, _ := utf8.DecodeLastRuneInString(name)
-		if unicode.IsLetter(last) || unicode.IsDigit(last) || last == '_' {
-			pattern += `\b`
-		} else {
-			pattern += `(?:$|[^A-Za-z0-9_])`
-		}
 		toolPatterns = append(toolPatterns, toolPattern{
 			name:    name,
-			pattern: regexp.MustCompile(pattern),
+			pattern: regexp.MustCompile(toolMentionPattern(name)),
 		})
 	}
 	return toolPatterns
+}
+
+func toolMentionPattern(name string) string {
+	const separator = `[\s_-]+`
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return r == ' ' || r == '-'
+	})
+	for i := range parts {
+		parts[i] = regexp.QuoteMeta(parts[i])
+	}
+	body := strings.Join(parts, separator)
+	if len(parts) == 0 {
+		body = regexp.QuoteMeta(name)
+	}
+	pattern := `(?i)\b` + body
+	last, _ := utf8.DecodeLastRuneInString(name)
+	if unicode.IsLetter(last) || unicode.IsDigit(last) || last == '_' {
+		return pattern + `\b`
+	}
+	return pattern + `(?:$|[^A-Za-z0-9_])`
 }
 
 func newCheckboxRegex(label string) *regexp.Regexp {
@@ -48,9 +55,13 @@ func stripComments(text string) string {
 	return re.ReplaceAllString(text, "")
 }
 
-func matchTools(text string) []toolMatch {
-	matches := make([]toolMatch, 0, len(toolPatterns))
-	for _, tp := range toolPatterns {
+func (d *Detector) matchTools(text string) []toolMatch {
+	patterns := d.patterns
+	if patterns == nil {
+		patterns = toolPatterns
+	}
+	matches := make([]toolMatch, 0, len(patterns))
+	for _, tp := range patterns {
 		for _, loc := range tp.pattern.FindAllStringIndex(text, -1) {
 			matches = append(matches, toolMatch{
 				start: loc[0],
@@ -70,7 +81,7 @@ func matchTools(text string) []toolMatch {
 	})
 
 	toolMatches := make([]toolMatch, 0, len(matches))
-	seen := make(map[string]struct{}, len(toolPatterns))
+	seen := make(map[string]struct{}, len(patterns))
 	lastEnd := -1
 	for _, match := range matches {
 		if match.start < lastEnd {
@@ -104,6 +115,7 @@ type Detector struct {
 	CheckboxAIUsedRegex      *regexp.Regexp
 	CheckboxAINotUsedRegex   *regexp.Regexp
 	initOnce                 sync.Once
+	patterns                 []toolPattern
 }
 
 var toolPatterns []toolPattern
@@ -128,6 +140,38 @@ func (d *Detector) appendFinding(findings *[]detection.Finding, toolName string,
 
 func (d *Detector) SetConfidenceLevels(confidenceLevels map[detection.Confidence]float64) {
 	d.ConfidenceLevels = confidenceLevels
+}
+
+// SetCustomTools supplements the built-in names for this detector only.
+// Call it before Detect; repeated calls replace the previous custom names.
+func (d *Detector) SetCustomTools(names []string) error {
+	if len(names) == 0 {
+		d.patterns = nil
+		return nil
+	}
+	patterns := append([]toolPattern(nil), toolPatterns...)
+	seen := make(map[string]bool, len(patterns)+len(names))
+	for _, tp := range patterns {
+		seen[strings.ToLower(tp.name)] = true
+	}
+	for i, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("custom_tools[%d] must be a non-empty name", i)
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		pattern, err := regexp.Compile(toolMentionPattern(name))
+		if err != nil {
+			return fmt.Errorf("custom_tools[%d]: %w", i, err)
+		}
+		patterns = append(patterns, toolPattern{name: name, pattern: pattern})
+		seen[key] = true
+	}
+	d.patterns = patterns
+	return nil
 }
 
 // SetCheckboxConfig configures the checkbox labels.
@@ -156,7 +200,7 @@ func (d *Detector) Detect(input detection.Input) []detection.Finding {
 		return d.checkboxAwareDetect(text)
 	}
 
-	toolMatches := matchTools(text)
+	toolMatches := d.matchTools(text)
 	findings := make([]detection.Finding, 0, len(toolMatches))
 	if len(toolMatches) > 0 {
 		score := detection.ToolMentionBaseScore
@@ -170,7 +214,7 @@ func (d *Detector) Detect(input detection.Input) []detection.Finding {
 
 func (d *Detector) checkboxAwareDetect(inputText string) []detection.Finding {
 	inputText = stripComments(inputText)
-	toolMatches := matchTools(inputText)
+	toolMatches := d.matchTools(inputText)
 
 	var aiUsedCbTicked, aiNotUsedCbTicked bool
 
