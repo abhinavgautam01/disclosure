@@ -6,8 +6,36 @@ import (
 	"github.com/chaoss/disclosure/detection"
 )
 
+const (
+	directMatchScore = detection.CommitterMatchBaseScore +
+		detection.CommitterKnownEmailBonusPoints
+
+	numericPrefixScore = detection.CommitterMatchBaseScore +
+		detection.CommitterEmailSuffixBonusPoints
+)
+
+func assertFindingMetadata(t *testing.T, finding detection.Finding, expectedScore float64) {
+	t.Helper()
+
+	if finding.Score != expectedScore {
+		t.Errorf("score = %v, want %v", finding.Score, expectedScore)
+	}
+
+	expectedConfidence := detection.ScoreToConfidence(
+		detection.GetDefaultConfidenceLevels(), expectedScore,
+	)
+
+	if finding.Confidence != expectedConfidence {
+		t.Errorf("confidence = %d, want %d", finding.Confidence, expectedConfidence)
+	}
+
+	if finding.Detector != "committer" {
+		t.Errorf("detector = %q, want %q", finding.Detector, "committer")
+	}
+}
+
 func TestDetectAllKnownEmails(t *testing.T) {
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	for email, expectedName := range detection.KnownAgentCommitters {
 		input := detection.Input{CommitEmail: email}
 		findings := d.Detect(input)
@@ -18,17 +46,12 @@ func TestDetectAllKnownEmails(t *testing.T) {
 		if findings[0].Tool != expectedName {
 			t.Errorf("Detect(%q): tool = %q, want %q", email, findings[0].Tool, expectedName)
 		}
-		if findings[0].Confidence != detection.ConfidenceHigh {
-			t.Errorf("Detect(%q): confidence = %d, want %d", email, findings[0].Confidence, detection.ConfidenceHigh)
-		}
-		if findings[0].Detector != "committer" {
-			t.Errorf("Detect(%q): detector = %q, want %q", email, findings[0].Detector, "committer")
-		}
+		assertFindingMetadata(t, findings[0], directMatchScore)
 	}
 }
 
 func TestDetectMixedCase(t *testing.T) {
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	cases := []struct {
 		input    string
 		wantTool string
@@ -36,6 +59,7 @@ func TestDetectMixedCase(t *testing.T) {
 		{"198982749+Copilot@users.noreply.github.com", "GitHub Copilot (agent)"},
 		{"209825114+CLAUDE[BOT]@USERS.NOREPLY.GITHUB.COM", "Claude"},
 		{"136622811+CodeRabbitAI[bot]@users.noreply.github.com", "CodeRabbit"},
+		{"151058649+codiumai-pr-agent-pro[bot]@users.noreply.github.com", "PR-Agent Pro"},
 	}
 
 	for _, tc := range cases {
@@ -47,11 +71,12 @@ func TestDetectMixedCase(t *testing.T) {
 		if findings[0].Tool != tc.wantTool {
 			t.Errorf("Detect(%q): tool = %q, want %q", tc.input, findings[0].Tool, tc.wantTool)
 		}
+		assertFindingMetadata(t, findings[0], directMatchScore)
 	}
 }
 
 func TestDetectWhitespace(t *testing.T) {
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	cases := []string{
 		"  209825114+claude[bot]@users.noreply.github.com",
 		"209825114+claude[bot]@users.noreply.github.com  ",
@@ -67,11 +92,12 @@ func TestDetectWhitespace(t *testing.T) {
 		if findings[0].Tool != "Claude" {
 			t.Errorf("Detect(%q): tool = %q, want %q", email, findings[0].Tool, "Claude")
 		}
+		assertFindingMetadata(t, findings[0], directMatchScore)
 	}
 }
 
 func TestDetectNotFound(t *testing.T) {
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	cases := []string{
 		"user@example.com",
 		"",
@@ -89,7 +115,7 @@ func TestDetectNotFound(t *testing.T) {
 }
 
 func TestDetectNumericPrefix(t *testing.T) {
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	// Simulate a renamed bot: same numeric ID, different username
 	cases := []struct {
 		input    string
@@ -101,6 +127,10 @@ func TestDetectNumericPrefix(t *testing.T) {
 		{"198982749+copilot-v2@users.noreply.github.com", "GitHub Copilot (agent)"},
 		// CodeRabbit with a different username
 		{"136622811+coderabbit-new@users.noreply.github.com", "CodeRabbit"},
+		// PR-Agent Pro with a different username
+		{"151058649+pr-agent-pro-renamed@users.noreply.github.com", "PR-Agent Pro"},
+		// PR-Agent Pro rebranded username
+		{"151058649+qodo-code-review[bot]@users.noreply.github.com", "PR-Agent Pro"},
 	}
 
 	for _, tc := range cases {
@@ -112,11 +142,12 @@ func TestDetectNumericPrefix(t *testing.T) {
 		if findings[0].Tool != tc.wantTool {
 			t.Errorf("Detect(%q): tool = %q, want %q", tc.input, findings[0].Tool, tc.wantTool)
 		}
+		assertFindingMetadata(t, findings[0], numericPrefixScore)
 	}
 }
 
 func TestDetectNumericPrefixNoFalsePositive(t *testing.T) {
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	// An email with a numeric prefix that doesn't match any known bot
 	cases := []string{
 		"999999999+someone@users.noreply.github.com",
@@ -135,10 +166,11 @@ func TestDetectAuthorAndCommitter(t *testing.T) {
 	const (
 		claudeEmail  = "209825114+claude[bot]@users.noreply.github.com"
 		copilotEmail = "198982749+copilot@users.noreply.github.com"
+		prAgentEmail = "151058649+codiumai-pr-agent-pro[bot]@users.noreply.github.com"
 		humanEmail   = "human@example.com"
 	)
 
-	d := &Detector{}
+	d := &Detector{ConfidenceLevels: detection.GetDefaultConfidenceLevels()}
 	tests := []struct {
 		name        string
 		input       detection.Input
@@ -165,6 +197,27 @@ func TestDetectAuthorAndCommitter(t *testing.T) {
 			wantTools: []string{detection.KnownAgentCommitters[claudeEmail]},
 			wantDetails: []string{
 				"committer email " + claudeEmail + " matches known AI bot",
+			},
+		},
+		{
+			name: "committer only with PR-Agent Pro in the wild",
+			input: detection.Input{
+				AuthorEmail: humanEmail,
+				CommitEmail: prAgentEmail,
+			},
+			wantTools: []string{detection.KnownAgentCommitters[prAgentEmail]},
+			wantDetails: []string{
+				"committer email " + prAgentEmail + " matches known AI bot",
+			},
+		},
+		{
+			name: "committer in the wild without author",
+			input: detection.Input{
+				CommitEmail: prAgentEmail,
+			},
+			wantTools: []string{detection.KnownAgentCommitters[prAgentEmail]},
+			wantDetails: []string{
+				"committer email " + prAgentEmail + " matches known AI bot",
 			},
 		},
 		{
@@ -208,6 +261,7 @@ func TestDetectAuthorAndCommitter(t *testing.T) {
 				if finding.Detail != tt.wantDetails[i] {
 					t.Errorf("finding %d detail = %q, want %q", i, finding.Detail, tt.wantDetails[i])
 				}
+				assertFindingMetadata(t, finding, directMatchScore)
 			}
 		})
 	}

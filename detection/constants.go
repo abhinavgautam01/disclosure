@@ -1,15 +1,13 @@
 package detection
 
-import (
-	"regexp"
-	"strings"
-)
+import "regexp"
 
 // KnownAgentCommitters maps GitHub noreply emails to AI tool names.
 var KnownAgentCommitters = map[string]string{
 	"209825114+claude[bot]@users.noreply.github.com":                  "Claude",
 	"215619710+anthropic-claude[bot]@users.noreply.github.com":        "Claude (Anthropic)",
 	"208546643+claude-code-action[bot]@users.noreply.github.com":      "Claude Code Action",
+	"175728472+copilot@users.noreply.github.com":                      "GitHub Copilot",
 	"198982749+copilot@users.noreply.github.com":                      "GitHub Copilot (agent)",
 	"167198135+copilot[bot]@users.noreply.github.com":                 "GitHub Copilot (chat)",
 	"206951365+cursor[bot]@users.noreply.github.com":                  "Cursor",
@@ -23,10 +21,18 @@ var KnownAgentCommitters = map[string]string{
 	"201248094+sourcegraph-cody[bot]@users.noreply.github.com":        "Sourcegraph Cody",
 	"220155983+jetbrains-ai[bot]@users.noreply.github.com":            "JetBrains AI",
 	"136622811+coderabbitai[bot]@users.noreply.github.com":            "CodeRabbit",
+	"151058649+codiumai-pr-agent-pro[bot]@users.noreply.github.com":    "PR-Agent Pro",
 }
 
 // GithubNoReplyEmailSuffix GitHub noreply emails suffix to check committer emails.
 var GithubNoReplyEmailSuffix = "@users.noreply.github.com"
+
+// HtmlCommentPattern regex for html comments in markdown e.g. <!-- this is a comment -->
+var HtmlCommentPattern = `(?s)<!--.*?-->`
+
+// Default labels for checkboxes declaring AI used (or not)
+var DefaultCheckboxAIUsedLabel = "This contribution was assisted or created by Generative AI tools."
+var DefaultCheckboxAINotUsedLabel = "This contribution was NOT assisted or created by Generative AI tools."
 
 // SupportedToolsInMentions List of all supported tools to detect in tool mentions within commits.
 var SupportedToolsInMentions = []string{
@@ -133,74 +139,17 @@ var SupportedToolsInMentions = []string{
 	"CodeWhisperer",
 }
 
-var genericModelMentionKeys = map[string]struct{}{
-	"auto":             {},
-	"autorouter":       {},
-	"bodybuilder":      {},
-	"commanda":         {},
-	"commandr":         {},
-	"free":             {},
-	"freemodelsrouter": {},
-	"o1":               {},
-	"o3":               {},
-	"r1":               {},
-	"router":           {},
-	"saba":             {},
-	"sonar":            {},
-	"spotlight":        {},
-	"uncensored":       {},
-	"weaver":           {},
-}
-
-func SupportedToolMentions(includeGenerated bool) []string {
-	mentions := append([]string(nil), SupportedToolsInMentions...)
-	if includeGenerated {
-		mentions = appendCanonicalMentions(mentions, GeneratedModelMentions...)
-	}
-	return mentions
-}
-
-func appendCanonicalMentions(existing []string, candidates ...string) []string {
-	seen := make(map[string]struct{}, len(existing)+len(candidates))
-	for _, item := range existing {
-		key := strings.ToLower(strings.TrimSpace(item))
-		if key != "" {
-			seen[key] = struct{}{}
-		}
-	}
-
-	for _, candidate := range candidates {
-		canonical := strings.TrimSpace(candidate)
-		key := strings.ToLower(canonical)
-		if key == "" {
-			continue
-		}
-		if _, isGeneric := genericModelMentionKeys[modelMentionKey(canonical)]; isGeneric {
-			continue
-		}
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		existing = append(existing, canonical)
-		seen[key] = struct{}{}
-	}
-
-	return existing
-}
-
-func modelMentionKey(model string) string {
-	return strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' {
-			return r
-		}
-		if r >= 'A' && r <= 'Z' {
-			return r + ('a' - 'A')
-		}
-		if r >= '0' && r <= '9' {
-			return r
-		}
-		return -1
-	}, model)
+// KnownAgentBranchPrefixes maps branch name prefixes used by AI coding CLIs/agents
+// when they create their own branches (e.g. "codex/fix-bug") to tool names.
+var KnownAgentBranchPrefixes = map[string]string{
+	"codex/":   "OpenAI Codex",
+	"claude/":  "Claude",
+	"copilot/": "GitHub Copilot",
+	"cursor/":  "Cursor",
+	"devin/":   "Devin",
+	"cline/":   "Cline",
+	"aider/":   "Aider",
+	"gemini/":  "Gemini",
 }
 
 // KnownCoAuthorEmails Known emails present with Co-Authored-By trailers
@@ -246,3 +195,31 @@ var GitNotesAuthorshipPrefix = "authorship/"
 
 // TrailerEmailPattern Regex to match email address in commit trailers
 var TrailerEmailPattern = regexp.MustCompile(`\s*<[^>]+>`)
+
+// Numeric scoring constants for respective detectors
+const (
+	// Trailer detector
+	CoauthoredByTrailerBaseScore  float64 = 40.0
+	CoauthorKnownEmailBonusPoints float64 = 35.0
+	CoauthorModelBonusPoints      float64 = 10.0
+	AssistedByTrailerBaseScore    float64 = 75.0
+	TrailerMatchBaseScore         float64 = 35.0
+	TrailerNotMatchedScore        float64 = 0.0
+	AdditionalTrailerBonusPoints  float64 = 20.0
+	SessionIDBonusPoints          float64 = 45.0
+
+	// Tool mention detector
+	ToolMentionBaseScore    float64 = 20.0
+	CheckboxAIUsedBaseScore float64 = 75.0
+
+	// Committer detector
+	CommitterMatchBaseScore         float64 = 75.0
+	CommitterKnownEmailBonusPoints  float64 = 20.0
+	CommitterEmailSuffixBonusPoints float64 = 10.0
+
+	// Gitnotes detector
+	GitNotesMatchBaseScore float64 = 75.0
+
+	// Branch name detector
+	BranchNameBaseScore float64 = 75.0
+)

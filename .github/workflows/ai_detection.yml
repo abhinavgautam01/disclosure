@@ -24,5 +24,11 @@ jobs:
       with:
         # we get commit history from base as its needed by the AI detection action
         fetch-depth: 0
+        persist-credentials: false
     - name: Run AI detection action
       uses: ./action
+      with:
+        min-confidence: 'medium'
+        enable-checkbox-detection: 'true'
+        cb-disclosed-ai: 'This PR uses AI/LLMs'
+        cb-disclosed-noai: 'This PR does not use AI/LLMs'

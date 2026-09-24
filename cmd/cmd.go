@@ -4,12 +4,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/chaoss/disclosure/detection"
+	"github.com/chaoss/disclosure/detection/branchname"
 	"github.com/chaoss/disclosure/detection/committer"
 	"github.com/chaoss/disclosure/detection/gitnotes"
 	"github.com/chaoss/disclosure/detection/toolmention"
@@ -22,6 +26,32 @@ import (
 
 var Version = "dev"
 
+// resolveVersion returns the CLI version to display. Release builds inject the
+// version at link time via ldflags (-X ...cmd.Version=...). When that has not
+// happened, fall back to the module version recorded in binary's build info.
+func resolveVersion() string {
+	return versionFrom(Version, readBuildVersion)
+}
+
+// versionFrom selects the version string, preferring an ldflags override and
+// otherwise using the build-info version. It is split out for testability.
+func versionFrom(override string, buildVersion func() string) string {
+	if override != "dev" && override != "" {
+		return override
+	}
+	if bv := buildVersion(); bv != "" && bv != "(devel)" {
+		return bv
+	}
+	return "dev"
+}
+
+func readBuildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return ""
+}
+
 // Exit codes
 const (
 	ExitNoAI  = 0
@@ -29,13 +59,59 @@ const (
 	ExitError = 2
 )
 
-func allDetectors(includeModelCatalog bool) []detection.Detector {
+// detectorConfig struct to hold config properties for any of the detectors.
+type detectorConfig struct {
+	checkboxAIUsedLabel     string
+	checkboxAINotUsedLabel  string
+	enableCheckboxDetection bool
+}
+
+func allDetectors(confidenceLevels map[detection.Confidence]float64, config detectorConfig) []detection.Detector {
+	toolmentionDetector := &toolmention.Detector{}
+	toolmentionDetector.SetConfidenceLevels(confidenceLevels)
+	toolmentionDetector.SetCheckboxConfig(
+		config.enableCheckboxDetection, config.checkboxAIUsedLabel, config.checkboxAINotUsedLabel,
+	)
 	return []detection.Detector{
-		&committer.Detector{},
-		&gitnotes.Detector{},
-		&trailer.Detector{},
-		&toolmention.Detector{IncludeModelCatalog: includeModelCatalog},
+		&committer.Detector{ConfidenceLevels: confidenceLevels},
+		&gitnotes.Detector{ConfidenceLevels: confidenceLevels},
+		&trailer.Detector{ConfidenceLevels: confidenceLevels},
+		toolmentionDetector,
+		&branchname.Detector{ConfidenceLevels: confidenceLevels},
 	}
+}
+
+// parseKeyValueFloatList parses strings like "a=1,b=2.5" into a map[string]float64.
+func parseKeyValueFloatList(s string) (map[string]float64, error) {
+	out := map[string]float64{}
+	if strings.TrimSpace(s) == "" {
+		return out, nil
+	}
+	parts := strings.SplitSeq(s, ",")
+	for p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid entry: %q", p)
+		}
+		key := strings.TrimSpace(kv[0])
+		if key == "" {
+			return nil, fmt.Errorf("empty key in entry: %q", p)
+		}
+		valStr := strings.TrimSpace(kv[1])
+		if valStr == "" {
+			return nil, fmt.Errorf("empty value in entry: %q", p)
+		}
+		v, err := strconv.ParseFloat(valStr, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("invalid numeric value %q in entry %q", valStr, p)
+		}
+		out[key] = v
+	}
+	return out, nil
 }
 
 // Run is the main entry point for the CLI. Returns an exit code.
@@ -81,7 +157,7 @@ func scanCommand(stdout, stderr io.Writer, exitCode *int) *cobra.Command {
 	var rangeFlag string
 	var formatFlag string
 	var minConfFlag string
-	var includeModelCatalogFlag bool
+	var confidenceLevelsFlag string
 
 	cmd := &cobra.Command{
 		Use:   "scan [repo-path]",
@@ -95,6 +171,7 @@ Checks each commit for:
   - AI session ID trailers
   - Commit message patterns (aider:, Generated with Claude Code, etc.)
   - Tool name mentions in commit messages
+  - Branch naming conventions used by AI CLIs (codex/, claude/, cursor/, etc.)
 
 Examples:
   disclosure scan
@@ -116,7 +193,11 @@ Examples:
   else
     echo "AI involvement detected"
     exit 1
-  fi`,
+  fi
+
+  # Set custom confidence levels
+  disclosure scan --confidence-levels=low=20,medium=50, high=100 --format=json
+  `,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			repoPath := "."
@@ -124,14 +205,33 @@ Examples:
 				repoPath = args[0]
 			}
 
-			minConf, err := output.ConfidenceFromString(minConfFlag)
+			minConf, err := detection.ConfidenceFromString(minConfFlag)
 			if err != nil {
 				fmt.Fprintln(stderr, err)
 				*exitCode = ExitError
 				return err
 			}
 
-			detectors := allDetectors(includeModelCatalogFlag)
+			// parse confidence-levels override if provided
+			confidenceLevels := detection.GetDefaultConfidenceLevels()
+			if strings.TrimSpace(confidenceLevelsFlag) != "" {
+				flagMap, err := parseKeyValueFloatList(confidenceLevelsFlag)
+				if err != nil {
+					fmt.Fprintln(stderr, err)
+					*exitCode = ExitError
+					return err
+				}
+				if confidenceLevels, err = detection.SetConfidenceLevelsFromStrings(
+					confidenceLevels,
+					flagMap,
+				); err != nil {
+					fmt.Fprintln(stderr, err)
+					*exitCode = ExitError
+					return err
+				}
+			}
+
+			detectors := allDetectors(confidenceLevels, detectorConfig{})
 			report, err := scan.ScanCommitRange(repoPath, rangeFlag, detectors)
 			if err != nil {
 				fmt.Fprintf(stderr, "error: %v\n", err)
@@ -139,7 +239,7 @@ Examples:
 				return err
 			}
 
-			report = filterReport(report, minConf)
+			report = filterReport(report, minConf, confidenceLevels)
 
 			switch formatFlag {
 			case "json":
@@ -171,7 +271,7 @@ Examples:
 	cmd.Flags().StringVar(&rangeFlag, "range", "", "commit range in BASE..HEAD format")
 	cmd.Flags().StringVar(&formatFlag, "format", "text", "output format: json or text")
 	cmd.Flags().StringVar(&minConfFlag, "min-confidence", "low", "minimum confidence level: low, medium, high (or 1, 2, 3)")
-	cmd.Flags().BoolVar(&includeModelCatalogFlag, "include-model-catalog", false, "include generated model catalogue in low-confidence text matching")
+	cmd.Flags().StringVar(&confidenceLevelsFlag, "confidence-levels", "", "override confidence->score mapping, e.g. 'low=20,medium=60,high=100'")
 
 	return cmd
 }
@@ -179,7 +279,9 @@ Examples:
 func textCommand(stdout, stderr io.Writer, exitCode *int) *cobra.Command {
 	var formatFlag string
 	var inputFlag string
-	var includeModelCatalogFlag bool
+	var checkboxAIUsedLabel string
+	var checkboxAINotUsedLabel string
+	var enableCheckboxDetection bool
 
 	cmd := &cobra.Command{
 		Use:   "text",
@@ -207,7 +309,15 @@ Examples:
   cat comment.txt | disclosure text --min-confidence=medium
 
   # Use in a pipeline
-  disclosure text --input=review.txt --format=json | jq '.findings'`,
+  disclosure text --input=review.txt --format=json | jq '.findings'
+
+  # Use checkbox labels
+  disclosure text \
+	--enable-checkbox-detection
+	--cb-disclosed-ai="AI was used in this PR" \
+	--cb-disclosed-noai="AI was not used in this PR" \
+	--input=pr-body.txt
+  `,
 		RunE: func(_ *cobra.Command, args []string) error {
 			var textBytes []byte
 			var err error
@@ -223,7 +333,11 @@ Examples:
 				return err
 			}
 
-			detectors := allDetectors(includeModelCatalogFlag)
+			detectors := allDetectors(detection.GetDefaultConfidenceLevels(), detectorConfig{
+				checkboxAIUsedLabel:     checkboxAIUsedLabel,
+				checkboxAINotUsedLabel:  checkboxAINotUsedLabel,
+				enableCheckboxDetection: enableCheckboxDetection,
+			})
 			findings := scan.ScanText(string(textBytes), detectors)
 
 			switch formatFlag {
@@ -253,9 +367,26 @@ Examples:
 		},
 	}
 
+	cmd.Flags().BoolVar(
+		&enableCheckboxDetection,
+		"enable-checkbox-detection",
+		false,
+		"flag to enable detecting ai use checkboxes in specified text",
+	)
+	cmd.Flags().StringVar(
+		&checkboxAIUsedLabel,
+		"cb-disclosed-ai",
+		detection.DefaultCheckboxAIUsedLabel,
+		"string label for checkbox for AI use declaration",
+	)
+	cmd.Flags().StringVar(
+		&checkboxAINotUsedLabel,
+		"cb-disclosed-noai",
+		detection.DefaultCheckboxAINotUsedLabel,
+		"string label for checkbox for no AI use declaration",
+	)
 	cmd.Flags().StringVar(&formatFlag, "format", "text", "output format: json or text")
 	cmd.Flags().StringVar(&inputFlag, "input", "-", "input file path, or - for stdin")
-	cmd.Flags().BoolVar(&includeModelCatalogFlag, "include-model-catalog", false, "include generated model catalogue in low-confidence text matching")
 
 	return cmd
 }
@@ -272,13 +403,17 @@ Examples:
 		Example: `  disclosure version
   disclosure version --format=json`,
 		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Fprintf(stdout, "disclosure %s\n", Version)
+			fmt.Fprintf(stdout, "disclosure %s\n", resolveVersion())
 			*exitCode = ExitNoAI
 		},
 	}
 }
 
-func filterReport(report scan.Report, minConf detection.Confidence) scan.Report {
+func filterReport(
+	report scan.Report,
+	minConf detection.Confidence,
+	confidenceLevels map[detection.Confidence]float64,
+) scan.Report {
 	if minConf <= detection.ConfidenceLow {
 		return report
 	}
@@ -292,22 +427,31 @@ func filterReport(report scan.Report, minConf detection.Confidence) scan.Report 
 		},
 	}
 
-	for _, cr := range report.Commits {
-		var kept []detection.Finding
-		for _, f := range cr.Findings {
+	for _, commit := range report.Commits {
+		var commitFindings []detection.Finding
+		for _, f := range commit.Findings {
 			if f.Confidence >= minConf {
-				kept = append(kept, f)
+				commitFindings = append(commitFindings, f)
 			}
 		}
-		result := scan.CommitResult{Hash: cr.Hash, Findings: kept}
-		filtered.Commits = append(filtered.Commits, result)
 
-		if len(kept) > 0 {
+		// Recompute per-commit score from the kept findings
+		commitScore, perDetectorScores := detection.ConsolidateScoreByFindings(commitFindings)
+		confidence := detection.ScoreToConfidence(confidenceLevels, commitScore)
+		result := scan.CommitResult{
+			Hash:              commit.Hash,
+			Findings:          commitFindings,
+			Score:             commitScore,
+			Confidence:        confidence,
+			PerDetectorScores: perDetectorScores,
+		}
+		filtered.Commits = append(filtered.Commits, result)
+		if len(commitFindings) > 0 {
 			filtered.Summary.AICommits++
 		}
-		for _, f := range kept {
-			filtered.Summary.ToolCounts[f.Tool]++
-			filtered.Summary.ByConfidence[f.Confidence.String()]++
+		for _, commitFinding := range commitFindings {
+			filtered.Summary.ToolCounts[commitFinding.Tool]++
+			filtered.Summary.ByConfidence[commitFinding.Confidence.String()]++
 		}
 	}
 
@@ -353,7 +497,7 @@ func generateDocs(exitCode *int) *cobra.Command {
 				docDir = filepath.Clean(filepath.Join(outputDir, formatFlag))
 				err = os.MkdirAll(docDir, 0o750)
 			} else {
-				err = fmt.Errorf("unknown format: %s\n", formatFlag)
+				err = fmt.Errorf("unknown format: %s", formatFlag)
 			}
 			if err != nil {
 				return prepareError(err)

@@ -7,16 +7,20 @@ import (
 
 // CommitResult holds findings for a single commit.
 type CommitResult struct {
-	Hash     string              `json:"hash"`
-	Findings []detection.Finding `json:"findings"`
+	Hash              string               `json:"hash"`
+	Findings          []detection.Finding  `json:"findings"`
+	PerDetectorScores map[string]float64   `json:"per_detector_scores"`
+	Score             float64              `json:"score"`
+	Confidence        detection.Confidence `json:"confidence"`
 }
 
 // Summary aggregates stats across all commits scanned.
 type Summary struct {
-	TotalCommits int            `json:"total_commits"`
-	AICommits    int            `json:"ai_commits"`
-	ToolCounts   map[string]int `json:"tool_counts"`
-	ByConfidence map[string]int `json:"by_confidence"`
+	TotalCommits      int                `json:"total_commits"`
+	AICommits         int                `json:"ai_commits"`
+	ToolCounts        map[string]int     `json:"tool_counts"`
+	ByConfidence      map[string]int     `json:"by_confidence"`
+	PerDetectorScores map[string]float64 `json:"per_detector_scores"`
 }
 
 // Report holds the full scan results.
@@ -32,9 +36,13 @@ func ScanCommitRange(repoPath, commitRange string, detectors []detection.Detecto
 		return Report{}, err
 	}
 
+	// Best-effort: an empty branch name (e.g. detached HEAD, common in CI
+	// checkouts) simply means the branchname detector finds nothing.
+	branchName, _ := gitops.GetCurrentBranch(repoPath)
+
 	var results []CommitResult
 	for _, c := range commits {
-		result := scanOneCommit(c, detectors)
+		result := scanOneCommit(c, branchName, detectors)
 		results = append(results, result)
 	}
 
@@ -48,7 +56,8 @@ func ScanCommit(repoPath, hash string, detectors []detection.Detector) (CommitRe
 		return CommitResult{}, err
 	}
 
-	return scanOneCommit(c, detectors), nil
+	branchName, _ := gitops.GetCurrentBranch(repoPath)
+	return scanOneCommit(c, branchName, detectors), nil
 }
 
 // ScanText runs detectors against arbitrary text (PR body, comments, etc).
@@ -61,13 +70,14 @@ func ScanText(text string, detectors []detection.Detector) []detection.Finding {
 	return findings
 }
 
-func scanOneCommit(c gitops.Commit, detectors []detection.Detector) CommitResult {
+func scanOneCommit(c gitops.Commit, branchName string, detectors []detection.Detector) CommitResult {
 	input := detection.Input{
 		CommitHash:    c.Hash,
 		AuthorEmail:   c.AuthorEmail,
 		CommitEmail:   c.CommitterEmail,
 		CommitMessage: c.Message,
 		Notes:         c.Notes,
+		BranchName:    branchName,
 	}
 
 	var findings []detection.Finding
@@ -75,9 +85,25 @@ func scanOneCommit(c gitops.Commit, detectors []detection.Detector) CommitResult
 		findings = append(findings, d.Detect(input)...)
 	}
 
+	if len(detectors) == 0 {
+		return CommitResult{
+			Hash:              c.Hash,
+			Findings:          findings,
+			PerDetectorScores: nil,
+			Score:             0.0,
+			Confidence:        detection.ConfidenceNone,
+		}
+	}
+
+	confidenceLevels := detectors[0].GetConfidenceLevels()
+	score, perDetectorScores := detection.ConsolidateScoreByFindings(findings)
+	confidence := detection.ScoreToConfidence(confidenceLevels, score)
 	return CommitResult{
-		Hash:     c.Hash,
-		Findings: findings,
+		Hash:              c.Hash,
+		Findings:          findings,
+		PerDetectorScores: perDetectorScores,
+		Score:             score,
+		Confidence:        confidence,
 	}
 }
 
@@ -88,6 +114,7 @@ func buildReport(results []CommitResult) Report {
 		ByConfidence: map[string]int{},
 	}
 
+	var allFindings []detection.Finding
 	for _, r := range results {
 		if len(r.Findings) > 0 {
 			summary.AICommits++
@@ -95,8 +122,12 @@ func buildReport(results []CommitResult) Report {
 		for _, f := range r.Findings {
 			summary.ToolCounts[f.Tool]++
 			summary.ByConfidence[f.Confidence.String()]++
+			allFindings = append(allFindings, f)
 		}
 	}
+
+	_, perDetectorScores := detection.ConsolidateScoreByFindings(allFindings)
+	summary.PerDetectorScores = perDetectorScores
 
 	return Report{
 		Commits: results,
